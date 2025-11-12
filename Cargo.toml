@@ -1,0 +1,8 @@
+[package]
+name = "rust-tc-config"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+logos = "0.13"
+logos-derive = "0.13"
