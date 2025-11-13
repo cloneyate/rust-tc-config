@@ -2,7 +2,7 @@ use logos::Logos;
 use std::collections::HashMap;
 
 #[derive(Logos, Debug, PartialEq, Clone)]
-#[logos(skip r"[ \t\n\r]+")]
+#[logos(skip r"[ \t\r]+")] // 现在只跳过空格和制表符，保留换行符作为Token
 enum Token<'a> {
     #[token("<")]
     OpenTag,
@@ -13,14 +13,18 @@ enum Token<'a> {
     #[token("</")]
     EndTagStart,
 
-    #[regex(r"[a-zA-Z0-9_]+=", priority = 1, callback = |lex| lex.slice())]
-    Key(&'a str),
+    #[token("=")]
+    Equals,
+
+    #[token("\n")]
+    Newline,
 
     #[regex(r"#.*", priority = 1, callback = |lex| lex.slice())]
     Comment(&'a str),
 
-    #[regex(r"[^\s<>=]+", priority = 2, callback = |lex| lex.slice())]
-    Value(&'a str),
+    // 文本内容，需要包含至少一个非空白字符，避免与skip冲突
+    #[regex(r"[^<>=\n\s]+", priority = 2, callback = |lex| lex.slice())]
+    Text(&'a str),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -33,16 +37,40 @@ pub enum ConfigNode {
 
 impl ConfigNode {
     pub fn get(&self, path: &str) -> Option<&str> {
+        let node = self.get_node(path);
+        match node {
+            Some(ConfigNode::Value(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn get_items(&self, path: &str) -> Option<HashMap<String, String>> {
+        let node = self.get_node(path);
+        match node {
+            Some(ConfigNode::Section(map)) => {
+                let mut r = HashMap::new();
+                for (k, v) in map.iter() {
+                    if let ConfigNode::Value(value) = v {
+                        r.insert(k.clone(), value.clone());
+                    }
+                }
+                Some(r)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn get_node(&self, path: &str) -> Option<&ConfigNode> {
         let path = path.trim_start_matches('/');
         if path.is_empty() {
             return None;
         }
 
         let parts: Vec<&str> = path.split('/').collect();
-        self.get_by_parts(&parts)
+        self.get_node_by_parts(&parts)
     }
 
-    fn get_by_parts(&self, parts: &[&str]) -> Option<&str> {
+    fn get_node_by_parts(&self, parts: &[&str]) -> Option<&ConfigNode> {
         if parts.is_empty() {
             return None;
         }
@@ -50,12 +78,10 @@ impl ConfigNode {
         match self {
             ConfigNode::Section(map) => {
                 if parts.len() == 1 {
-                    if let Some(ConfigNode::Value(value)) = map.get(parts[0]) {
-                        return Some(value);
-                    }
+                    return map.get(parts[0]);
                 } else {
                     if let Some(node) = map.get(parts[0]) {
-                        return node.get_by_parts(&parts[1..]);
+                        return node.get_node_by_parts(&parts[1..]);
                     }
                 }
                 None
@@ -103,38 +129,63 @@ impl<'a> ConfigParser<'a> {
         }
     }
 
-    fn parse_identifier(&mut self) -> Result<&'a str, String> {
+    fn parse_text(&mut self) -> Result<&'a str, String> {
         match self.current_token() {
-            Some(Token::Value(ident)) => {
+            Some(Token::Text(ident)) => {
                 let name = *ident;
                 self.next_token();
                 Ok(name)
             }
-            _ => Err("Expected identifier".to_string()),
+            _ => Err("Expected Token Text".to_string()),
         }
     }
 
-    fn parse_key_value(&mut self) -> Result<(&'a str, &'a str), String> {
-        match self.current_token() {
-            Some(Token::Key(key)) => {
-                let key_str = key.trim_end_matches('=');
+    fn parse_key_value(&mut self) -> Result<(&'a str, String), String> {
+        // 解析键名
+        let key = match self.current_token() {
+            Some(Token::Text(ident)) => {
+                let key_str = *ident;
                 self.next_token();
-
-                let value = match self.current_token() {
-                    Some(Token::Value(val)) => *val,
-                    _ => return Err("Expected value after key".to_string()),
-                };
-                self.next_token();
-
-                Ok((key_str, value))
+                key_str
             }
-            _ => Err("Expected key-value pair".to_string()),
+            _ => return Err("Expected identifier for key".to_string()),
+        };
+
+        // 解析等号
+        self.expect_token(&Token::Equals)?;
+
+        // 收集所有的Text和Equals作为值，直到遇到换行符
+        let mut value_parts = Vec::new();
+        loop {
+            match self.current_token() {
+                Some(Token::Text(val)) => {
+                    value_parts.push(*val);
+                    self.next_token();
+                }
+                Some(Token::Equals) => {
+                    value_parts.push("=");
+                    self.next_token();
+                }
+                Some(Token::Newline) => {
+                    break;
+                }
+                _ => {
+                    return Err("Expected text value or equals or newline after equals".to_string());
+                }
+            }
         }
+
+        // 解析换行符
+        self.expect_token(&Token::Newline)?;
+
+        // 组合所有部分为值
+        let value = value_parts.join("").trim().to_string();
+        Ok((key, value))
     }
 
     fn parse_section(&mut self) -> Result<HashMap<String, ConfigNode>, String> {
         self.expect_token(&Token::OpenTag)?;
-        let section_name = self.parse_identifier()?.to_string();
+        let section_name = self.parse_text()?.to_string();
         self.expect_token(&Token::CloseTag)?;
 
         let mut children = HashMap::new();
@@ -146,17 +197,21 @@ impl<'a> ConfigParser<'a> {
                 }
                 Token::OpenTag => {
                     let subsection_content = self.parse_section()?;
-                    if let Some((subsection_name, subsection_node)) =
-                        subsection_content.into_iter().next()
-                    {
-                        children.insert(subsection_name, subsection_node);
+                    for (subsection_name, subsection_node) in subsection_content {
+                        // 如果已存在同名subsection，则忽略后来的subsection
+                        if !children.contains_key(&subsection_name) {
+                            children.insert(subsection_name, subsection_node);
+                        }
                     }
                 }
-                Token::Key(_) => {
+                Token::Text(_) => {
                     let (key, value) = self.parse_key_value()?;
-                    children.insert(key.to_string(), ConfigNode::Value(value.to_string()));
+                    children.insert(key.to_string(), ConfigNode::Value(value));
                 }
                 Token::Comment(_) => {
+                    self.next_token();
+                }
+                Token::Newline => {
                     self.next_token();
                 }
                 _ => {
@@ -166,7 +221,7 @@ impl<'a> ConfigParser<'a> {
         }
 
         self.expect_token(&Token::EndTagStart)?;
-        let end_section_name = self.parse_identifier()?;
+        let end_section_name = self.parse_text()?;
         if end_section_name != section_name {
             return Err(format!(
                 "Mismatched section tags: start {}, end {}",
@@ -188,15 +243,21 @@ impl<'a> ConfigParser<'a> {
                 Token::OpenTag => {
                     let section_content = self.parse_section()?;
                     for (section_name, section_node) in section_content {
-                        root_children.insert(section_name, section_node);
+                        // 如果已存在同名section，则忽略后来的section
+                        if !root_children.contains_key(&section_name) {
+                            root_children.insert(section_name, section_node);
+                        }
                     }
                 }
                 Token::Comment(_) => {
                     self.next_token();
                 }
-                Token::Key(_) => {
+                Token::Text(_) => {
                     let (key, value) = self.parse_key_value()?;
-                    root_children.insert(key.to_string(), ConfigNode::Value(value.to_string()));
+                    root_children.insert(key.to_string(), ConfigNode::Value(value));
+                }
+                Token::Newline => {
+                    self.next_token();
                 }
                 _ => break,
             }
@@ -235,6 +296,9 @@ mod tests {
 "#;
 
         let result = parse_config(config_str);
+        if let Err(e) = &result {
+            println!("Parse error: {}", e);
+        }
         assert!(result.is_ok());
 
         let config = result.unwrap();
@@ -264,6 +328,9 @@ mod tests {
 "#;
 
         let result = parse_config(config_str);
+        if let Err(e) = &result {
+            println!("Parse error: {}", e);
+        }
         assert!(result.is_ok());
 
         let config = result.unwrap();
@@ -279,7 +346,7 @@ mod tests {
     fn test_complex_config_structure() {
         let config_str = r#"
 <section_a>
-    a=b
+    a = b
     c=d
     <section_b>
         e=f
@@ -297,6 +364,9 @@ mod tests {
 "#;
 
         let result = parse_config(config_str);
+        if let Err(e) = &result {
+            println!("Parse error: {}", e);
+        }
         assert!(result.is_ok());
 
         let config = result.unwrap();
@@ -304,16 +374,15 @@ mod tests {
         assert_eq!(config.get("/section_a/c"), Some("d"));
         assert_eq!(config.get("/section_a/section_b/e"), Some("f"));
         assert_eq!(config.get("/section_a/section_b/g"), Some("h"));
-        assert_eq!(
-            config.get("/section_a/section_b/section_c/i"),
-            Some("j")
-        );
-        assert_eq!(
-            config.get("/section_a/section_b/section_c/k"),
-            Some("l")
-        );
+        assert_eq!(config.get("/section_a/section_b/section_c/i"), Some("j"));
+        assert_eq!(config.get("/section_a/section_b/section_c/k"), Some("l"));
         assert_eq!(config.get("/section_a/section_d/m"), Some("n"));
         assert_eq!(config.get("/section_a/section_d/o"), Some("p"));
+
+        let section_a_items = config.get_items("/section_a").unwrap();
+        assert_eq!(section_a_items.len(), 2);
+        assert_eq!(section_a_items["a"], "b");
+        assert_eq!(section_a_items["c"], "d");
     }
 
     #[test]
@@ -336,5 +405,35 @@ mod tests {
         assert_eq!(config.get("/section_a/section_b/section_c/c"), Some("d"));
         assert_eq!(config.get("/section_a/section_b/NonExistent"), None);
         assert_eq!(config.get("/NonExistent/section_b/a"), None);
+    }
+
+    #[test]
+    fn test_key_value_with_spaces() {
+        let config_str = r#"
+<section_a>
+    key_with_spaces = value_with_spaces
+    <section_b>
+        key = value
+        another_key   =   another_value  
+    </section_b>
+</section_a>
+"#;
+
+        let result = parse_config(config_str);
+        if let Err(e) = &result {
+            println!("Parse error: {}", e);
+        }
+        assert!(result.is_ok());
+
+        let config = result.unwrap();
+        assert_eq!(
+            config.get("/section_a/key_with_spaces"),
+            Some("value_with_spaces")
+        );
+        assert_eq!(config.get("/section_a/section_b/key"), Some("value"));
+        assert_eq!(
+            config.get("/section_a/section_b/another_key"),
+            Some("another_value")
+        );
     }
 }
