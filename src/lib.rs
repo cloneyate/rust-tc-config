@@ -2,7 +2,7 @@ use logos::Logos;
 use std::collections::HashMap;
 
 #[derive(Logos, Debug, PartialEq, Clone)]
-#[logos(skip r"[ \t\r]+")] // 现在只跳过空格和制表符，保留换行符作为Token
+#[logos(skip r"[\t\r]+")] // 保留空格，避免值中的原始空白被丢弃
 enum Token<'a> {
     #[token("<")]
     OpenTag,
@@ -22,8 +22,11 @@ enum Token<'a> {
     #[regex(r"#.*", priority = 1, callback = |lex| lex.slice())]
     Comment(&'a str),
 
-    // 文本内容，需要包含至少一个非空白字符，避免与skip冲突
-    #[regex(r"[^<>=\n\s]+", priority = 2, callback = |lex| lex.slice())]
+    #[regex(r" +", priority = 1, callback = |lex| lex.slice())]
+    Space(&'a str),
+
+    // 文本内容，不包含空格；空格会由 Space token 单独表示
+    #[regex(r"[^<>=\n ]+", priority = 2, callback = |lex| lex.slice())]
     Text(&'a str),
 }
 
@@ -132,7 +135,7 @@ impl<'a> ConfigParser<'a> {
     fn parse_text(&mut self) -> Result<&'a str, String> {
         match self.current_token() {
             Some(Token::Text(ident)) => {
-                let name = *ident;
+                let name = ident.trim();
                 self.next_token();
                 Ok(name)
             }
@@ -144,12 +147,16 @@ impl<'a> ConfigParser<'a> {
         // 解析键名
         let key = match self.current_token() {
             Some(Token::Text(ident)) => {
-                let key_str = *ident;
+                let key_str = ident.trim();
                 self.next_token();
                 key_str
             }
             _ => return Err("Expected identifier for key".to_string()),
         };
+
+        while matches!(self.current_token(), Some(Token::Space(_))) {
+            self.next_token();
+        }
 
         // 解析等号
         self.expect_token(&Token::Equals)?;
@@ -164,6 +171,10 @@ impl<'a> ConfigParser<'a> {
                 }
                 Some(Token::Equals) => {
                     value_parts.push("=");
+                    self.next_token();
+                }
+                Some(Token::Space(sp)) => {
+                    value_parts.push(*sp);
                     self.next_token();
                 }
                 Some(Token::Newline) => {
@@ -211,6 +222,9 @@ impl<'a> ConfigParser<'a> {
                 Token::Comment(_) => {
                     self.next_token();
                 }
+                Token::Space(_) => {
+                    self.next_token();
+                }
                 Token::Newline => {
                     self.next_token();
                 }
@@ -250,6 +264,9 @@ impl<'a> ConfigParser<'a> {
                     }
                 }
                 Token::Comment(_) => {
+                    self.next_token();
+                }
+                Token::Space(_) => {
                     self.next_token();
                 }
                 Token::Text(_) => {
@@ -434,6 +451,29 @@ mod tests {
         assert_eq!(
             config.get("/section_a/section_b/another_key"),
             Some("another_value")
+        );
+    }
+
+    #[test]
+    fn test_value_preserves_internal_spaces() {
+        let config_str = r#"
+<taf>
+    <Connection>
+        sample_key=part_one; part_two; part_three; part_four; part_five
+        sample_key_trim = part_one; part_two; part_three; part_four; part_five
+    </Connection>
+</taf>
+"#;
+
+        let config = parse_config(config_str).unwrap();
+
+        assert_eq!(
+            config.get("/taf/Connection/sample_key"),
+            Some("part_one; part_two; part_three; part_four; part_five")
+        );
+        assert_eq!(
+            config.get("/taf/Connection/sample_key_trim"),
+            Some("part_one; part_two; part_three; part_four; part_five")
         );
     }
 }
